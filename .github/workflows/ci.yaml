@@ -1,7 +1,101 @@
-on: workflow_dispatch
+name: Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      super_ref:
+        description: 'brimdata/super branch, tag, or SHA to test against'
+        default: main
+        required: false
+  repository_dispatch:
+    types: [super-pr-merged]
+  schedule:
+    - cron: '5 8 * * *'
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - run: echo "placeholder"
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: brimdata/super
+          ref: ${{ inputs.super_ref || 'main' }}
+          path: super
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: super/go.mod
+          cache-dependency-path: super/go.sum
+      - run: go build -o $GITHUB_WORKSPACE/bin/super ./cmd/super
+        working-directory: super
+      - name: Start super db serve (no auth)
+        run: |
+          $GITHUB_WORKSPACE/bin/super db -db $(mktemp -d) serve -l localhost:9867 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9867/status 2>/dev/null && break
+            sleep 1
+          done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install '.[test]'
+      - run: pytest test_superdb.py
+        env:
+          SUPER_DB: http://localhost:9867
+  test-auth:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: brimdata/super
+          ref: ${{ inputs.super_ref || 'main' }}
+          path: super
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: super/go.mod
+          cache-dependency-path: super/go.sum
+      - name: Build super and gentoken
+        run: |
+          go build -o $GITHUB_WORKSPACE/bin/super ./cmd/super
+          go build -o $GITHUB_WORKSPACE/bin/gentoken ./cmd/gentoken
+        working-directory: super
+      - name: Start super db serve (with auth)
+        run: |
+          $GITHUB_WORKSPACE/bin/super db -db $(mktemp -d) serve -l localhost:9867 \
+            -auth.enabled=t \
+            -auth.audience=a \
+            -auth.clientid=c \
+            -auth.domain=d \
+            -auth.jwkspath=$GITHUB_WORKSPACE/super/service/testdata/auth-public-jwks.json &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9867/status 2>/dev/null && break
+            sleep 1
+          done
+      - name: Store auth token
+        run: |
+          token=$($GITHUB_WORKSPACE/bin/gentoken \
+            -audience a -domain d -keyid testkey \
+            -privatekeyfile $GITHUB_WORKSPACE/super/service/testdata/auth-private-key \
+            -tenantid t -userid u)
+          $GITHUB_WORKSPACE/bin/super db auth store -access "$token" -db http://localhost:9867
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install '.[test]'
+      - run: pytest test_superdb.py test_auth.py
+        env:
+          SUPER_DB: http://localhost:9867
+          SUPER_DB_AUTH: '1'
+  notify:
+    runs-on: ubuntu-24.04
+    needs: [test, test-auth]
+    if: failure() && github.ref_name == 'main'
+    steps:
+      - run: |
+          curl -s -X POST ${{ secrets.SLACK_WEBHOOK_BRIMLABS_TEST }} \
+            -H 'Content-type: application/json' \
+            --data '{"username":"superdb-python","text":"Python client tests failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
